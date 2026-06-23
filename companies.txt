@@ -1,0 +1,27 @@
+# ATS company feed list for job_hunter.py
+# Format: ats_name:slug  (greenhouse / lever / ashby / workable / recruitee / smartrecruiters / personio)
+# Bare slug (no colon) = auto-detect; on first hit the line is rewritten to detected_ats:slug.
+# All entries below were verified live on 2026-06-24 and return > 0 jobs.
+#
+# To add a company: find its careers page. If the URL contains
+#   boards.greenhouse.io → slug is the last path segment → add greenhouse:slug
+#   jobs.lever.co       → slug is the last path segment → add lever:slug
+#   jobs.ashbyhq.com    → slug is the last path segment → add ashby:slug
+# Otherwise add the bare company name and let auto-detect probe all three ATS.
+
+# --- Greenhouse ---
+greenhouse:stripe
+greenhouse:datadog
+greenhouse:elastic
+greenhouse:cloudflare
+greenhouse:figma
+greenhouse:gitlab
+greenhouse:saucelabs
+greenhouse:bugcrowd
+greenhouse:testlio
+
+# --- Ashby ---
+ashby:ramp
+ashby:cursor
+ashby:linear
+ashby:deel

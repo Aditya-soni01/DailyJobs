@@ -84,3 +84,27 @@ Open `job_hunter.py` and edit the constants near the top:
 Set `LOCATION_FILTER=1` in your `.env` (or as a repo secret) to drop jobs
 that explicitly exclude India/APAC (e.g. "US only", "EU only").
 Jobs with unspecified or worldwide locations are always kept. Off by default.
+
+## ATS company feed (`companies.txt`)
+Many strong remote employers publish jobs through applicant tracking systems with
+public, keyless JSON endpoints. `companies.txt` lets you pull directly from them.
+
+**Why not just import the "remoteintech" company list?** That list contains mostly
+homepage URLs, which do not map cleanly to ATS slugs. `companies.txt` is seeded
+manually (by finding the careers-page slug) and is a _complement_ to the aggregator
+sources, not a bulk import of 600 sites.
+
+**How to add a company:**
+1. Find the company's careers page.
+2. If the URL contains `boards.greenhouse.io/…/jobs` → the last path segment
+   before `/jobs` is the slug. Add `greenhouse:that-slug`.
+3. If the URL contains `jobs.lever.co/…` → the last segment is the slug.
+   Add `lever:that-slug`.
+4. If the URL contains `jobs.ashbyhq.com/…` → the last segment is the slug.
+   Add `ashby:that-slug`.
+5. If unsure, just add the bare company name (e.g. `stripe`) and the bot will
+   probe greenhouse → lever → ashby automatically. On the first successful hit
+   the line is rewritten to `detected_ats:slug` so future runs skip the probing.
+
+The workflow commits `companies.txt` back to the repo after each run so cached
+auto-detections persist.

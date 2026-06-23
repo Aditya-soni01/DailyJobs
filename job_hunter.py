@@ -22,13 +22,15 @@ import time
 import smtplib
 import argparse
 import datetime as dt
+import concurrent.futures
+import xml.etree.ElementTree as ET
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 
 import requests
 
 try:
-    import feedparser  # only needed for the We Work Remotely RSS source
+    import feedparser  # only needed for the We Work Remotely / Working Nomads RSS source
 except ImportError:
     feedparser = None
 
@@ -44,6 +46,9 @@ except ImportError:
 
 UA = {"User-Agent": "Mozilla/5.0 (job-digest-bot; personal use)"}
 TIMEOUT = 25
+ATS_TIMEOUT = 15          # shorter per-request timeout for ATS fetches
+ATS_WORKERS = 10          # concurrent threads for ATS company fetching
+COMPANIES_FILE = "companies.txt"
 TOP_N = 25                       # how many jobs to include in the email
 RECENT_DAYS = 4                  # only consider jobs posted within this window
 SEEN_FILE = "seen.json"
@@ -71,7 +76,7 @@ ROLE_CORE = [
 SKILLS_HIGH = [
     "python", "pytest", "selenium", "robot framework", "playwright",
     "cypress", "api testing", "rest api", "api automation", "postman",
-    "appium", "requests",
+    "appium", "requests", "restassured", "rest assured", "rest-assured",
 ]
 SKILLS_MED = [
     "ci/cd", "jenkins", "github actions", "sql", "jira", "agile", "scrum",
@@ -234,7 +239,437 @@ def fetch_wwr(limit=None):
     return out
 
 
-SOURCES = [fetch_remoteok, fetch_remotive, fetch_arbeitnow, fetch_jobicy, fetch_wwr]
+def fetch_himalayas(limit=None):
+    """Pull QA/SDET roles from Himalayas free public API (no key required)."""
+    queries = ["QA", "SDET", "test automation"]
+    seen_urls = set()
+    out = []
+    for q in queries:
+        try:
+            url = f"https://himalayas.app/jobs/api/search?q={requests.utils.quote(q)}&seniority=Senior"
+            r = requests.get(url, headers=UA, timeout=TIMEOUT)
+            r.raise_for_status()
+            for j in r.json().get("jobs", []):
+                apply_url = j.get("applicationLink") or j.get("guid") or j.get("url", "")
+                if not apply_url or apply_url in seen_urls:
+                    continue
+                seen_urls.add(apply_url)
+                tags = []
+                for field in ("categories", "keywords"):
+                    val = j.get(field, [])
+                    if isinstance(val, list):
+                        tags.extend(str(v).lower() for v in val)
+                    elif isinstance(val, str):
+                        tags.append(val.lower())
+                out.append({
+                    "title": j.get("title", ""),
+                    "company": j.get("companyName", ""),
+                    "url": apply_url,
+                    "tags": tags,
+                    "location": ", ".join(j.get("locationRestrictions", [])) or "Remote",
+                    "posted": _parse_date(j.get("pubDate") or j.get("publishedDate")),
+                    "description": j.get("excerpt") or j.get("description", ""),
+                    "source": "Himalayas",
+                })
+                if limit and len(out) >= limit:
+                    return out
+        except Exception as e:
+            print(f"[warn] himalayas query '{q}': {e}")
+    return out
+
+
+def fetch_working_nomads(limit=None):
+    """Pull remote jobs from Working Nomads public JSON API (no key required)."""
+    out = []
+    try:
+        r = requests.get("https://www.workingnomads.com/api/exposed_jobs/",
+                         headers=UA, timeout=TIMEOUT)
+        r.raise_for_status()
+        jobs = r.json()
+        if not isinstance(jobs, list):
+            jobs = jobs.get("jobs", [])
+        for j in jobs:
+            tags = []
+            cats = j.get("tags", [])
+            if isinstance(cats, list):
+                tags = [str(c).lower() for c in cats]
+            out.append({
+                "title": j.get("title", ""),
+                "company": j.get("company", ""),
+                "url": j.get("url", "") or j.get("external_link", ""),
+                "tags": tags,
+                "location": j.get("location", "Remote"),
+                "posted": _parse_date(j.get("pub_date") or j.get("created_at")),
+                "description": j.get("description", ""),
+                "source": "WorkingNomads",
+            })
+            if limit and len(out) >= limit:
+                break
+    except Exception as e:
+        print(f"[warn] working_nomads JSON failed: {e}")
+        # Fallback: try RSS if feedparser is available
+        if feedparser is not None:
+            try:
+                feed = feedparser.parse("https://www.workingnomads.com/feed/")
+                for e in feed.entries:
+                    out.append({
+                        "title": e.get("title", ""),
+                        "company": "",
+                        "url": e.get("link", ""),
+                        "tags": [],
+                        "location": "Remote",
+                        "posted": _parse_date(e.get("published")),
+                        "description": re.sub("<[^>]+>", " ", e.get("summary", "")),
+                        "source": "WorkingNomads",
+                    })
+                    if limit and len(out) >= limit:
+                        break
+            except Exception as e2:
+                print(f"[warn] working_nomads RSS also failed: {e2}")
+    return out
+
+
+# --------------------------------------------------------------------------- #
+# ATS PUBLIC FEED LAYER
+# --------------------------------------------------------------------------- #
+
+_REMOTE_KEYWORDS = ("remote", "anywhere", "worldwide", "distributed",
+                    "work from home", "wfh", "fully remote", "location flexible")
+
+
+def _looks_remote(job):
+    """Return True if the job appears to be remote based on location/description."""
+    # Honour explicit _ashby_remote flag set during Ashby parsing
+    if job.get("_ashby_remote"):
+        return True
+    blob = (job.get("location", "") + " " + job.get("description", "")).lower()
+    return any(kw in blob for kw in _REMOTE_KEYWORDS)
+
+
+def _strip_html(text):
+    return re.sub("<[^>]+>", " ", text or "")
+
+
+def _gh_fetch(slug):
+    url = f"https://boards-api.greenhouse.io/v1/boards/{slug}/jobs?content=true"
+    r = requests.get(url, headers=UA, timeout=ATS_TIMEOUT)
+    r.raise_for_status()
+    out = []
+    for j in r.json().get("jobs", []):
+        loc = j.get("location", {})
+        loc_name = loc.get("name", "") if isinstance(loc, dict) else str(loc)
+        out.append({
+            "title": j.get("title", ""),
+            "company": slug,
+            "url": j.get("absolute_url", ""),
+            "tags": [d.get("name", "").lower() for d in j.get("departments", [])],
+            "location": loc_name,
+            "posted": _parse_date(j.get("updated_at")),
+            "description": _strip_html(j.get("content", "")),
+            "source": f"ATS:greenhouse/{slug}",
+        })
+    return out
+
+
+def _lever_fetch(slug):
+    url = f"https://api.lever.co/v0/postings/{slug}?mode=json"
+    r = requests.get(url, headers=UA, timeout=ATS_TIMEOUT)
+    r.raise_for_status()
+    data = r.json()
+    if not isinstance(data, list):
+        return []
+    out = []
+    for j in data:
+        cats = j.get("categories", {})
+        location = cats.get("location", "") or cats.get("allLocations", [""])[0] if cats.get("allLocations") else ""
+        out.append({
+            "title": j.get("text", ""),
+            "company": slug,
+            "url": j.get("hostedUrl", ""),
+            "tags": [cats.get("team", "").lower(), cats.get("department", "").lower()],
+            "location": location,
+            "posted": _parse_date(j.get("createdAt")),
+            "description": _strip_html(j.get("descriptionPlain") or j.get("description", "")),
+            "source": f"ATS:lever/{slug}",
+        })
+    return out
+
+
+def _ashby_fetch(slug):
+    url = f"https://api.ashbyhq.com/posting-api/job-board/{slug}?includeCompensation=true"
+    r = requests.get(url, headers=UA, timeout=ATS_TIMEOUT)
+    r.raise_for_status()
+    out = []
+    for j in r.json().get("jobs", []):
+        is_remote = j.get("isRemote", False) or j.get("workplaceType", "") == "Remote"
+        loc = j.get("location", "") or ("Remote" if is_remote else "")
+        dept = j.get("department", "")
+        tags = [dept.lower()] if isinstance(dept, str) and dept else []
+        out.append({
+            "title": j.get("title", ""),
+            "company": slug,
+            "url": j.get("applyUrl") or j.get("jobUrl", ""),
+            "tags": tags,
+            "location": loc,
+            "posted": _parse_date(j.get("publishedDate")),
+            "description": _strip_html(j.get("descriptionHtml") or j.get("description", "")),
+            "source": f"ATS:ashby/{slug}",
+            "_ashby_remote": is_remote,
+        })
+    return out
+
+
+def _workable_fetch(slug):
+    url = f"https://apply.workable.com/api/v3/accounts/{slug}/jobs"
+    r = requests.post(url, headers={**UA, "Content-Type": "application/json"},
+                      json={"query": "", "location": [], "department": [],
+                            "worktype": ["telecommute"]},
+                      timeout=ATS_TIMEOUT)
+    r.raise_for_status()
+    out = []
+    for j in r.json().get("results", []):
+        loc_obj = j.get("location", {})
+        loc = loc_obj.get("city", "") if isinstance(loc_obj, dict) else str(loc_obj)
+        out.append({
+            "title": j.get("title", ""),
+            "company": slug,
+            "url": f"https://apply.workable.com/{slug}/j/{j.get('shortcode', '')}",
+            "tags": [j.get("department", "").lower()],
+            "location": loc or "Remote",
+            "posted": _parse_date(j.get("created_at")),
+            "description": _strip_html(j.get("description", "")),
+            "source": f"ATS:workable/{slug}",
+        })
+    return out
+
+
+def _recruitee_fetch(slug):
+    url = f"https://{slug}.recruitee.com/api/offers/"
+    r = requests.get(url, headers=UA, timeout=ATS_TIMEOUT)
+    r.raise_for_status()
+    out = []
+    for j in r.json().get("offers", []):
+        out.append({
+            "title": j.get("title", ""),
+            "company": slug,
+            "url": j.get("careers_url", ""),
+            "tags": [t.lower() for t in j.get("tags", [])],
+            "location": j.get("location", "Remote"),
+            "posted": _parse_date(j.get("created_at")),
+            "description": _strip_html(j.get("description", "")),
+            "source": f"ATS:recruitee/{slug}",
+        })
+    return out
+
+
+def _smartrecruiters_fetch(slug):
+    url = f"https://api.smartrecruiters.com/v1/companies/{slug}/postings"
+    r = requests.get(url, headers=UA, timeout=ATS_TIMEOUT)
+    r.raise_for_status()
+    out = []
+    for j in r.json().get("content", []):
+        loc = j.get("location", {})
+        loc_str = loc.get("city", "") if isinstance(loc, dict) else str(loc)
+        if isinstance(loc, dict) and loc.get("remote"):
+            loc_str = "Remote"
+        out.append({
+            "title": j.get("name", ""),
+            "company": slug,
+            "url": j.get("ref", ""),
+            "tags": [j.get("department", {}).get("label", "").lower()],
+            "location": loc_str,
+            "posted": _parse_date(j.get("releasedDate")),
+            "description": "",
+            "source": f"ATS:smartrecruiters/{slug}",
+        })
+    return out
+
+
+def _personio_fetch(slug):
+    out = []
+    for tld in ("de", "com"):
+        try:
+            url = f"https://{slug}.jobs.personio.{tld}/xml?language=en"
+            r = requests.get(url, headers=UA, timeout=ATS_TIMEOUT)
+            r.raise_for_status()
+            root = ET.fromstring(r.content)
+            for pos in root.findall(".//position"):
+                def _t(tag):
+                    el = pos.find(tag)
+                    return el.text.strip() if el is not None and el.text else ""
+                apply_url = _t("applicationUrl") or _t("url")
+                out.append({
+                    "title": _t("title") or _t("name"),
+                    "company": slug,
+                    "url": apply_url,
+                    "tags": [_t("recruiting-category").lower()],
+                    "location": _t("office"),
+                    "posted": None,
+                    "description": _strip_html(_t("description")),
+                    "source": f"ATS:personio/{slug}",
+                })
+            if out:
+                return out
+        except Exception:
+            continue
+    return out
+
+
+_ATS_FETCHERS = {
+    "greenhouse": _gh_fetch,
+    "lever": _lever_fetch,
+    "ashby": _ashby_fetch,
+    "workable": _workable_fetch,
+    "recruitee": _recruitee_fetch,
+    "smartrecruiters": _smartrecruiters_fetch,
+    "personio": _personio_fetch,
+}
+
+
+def _autodetect_ats(slug):
+    """Probe greenhouse → lever → ashby. Return (ats_name, jobs) or (None, [])."""
+    for name in ("greenhouse", "lever", "ashby"):
+        try:
+            jobs = _ATS_FETCHERS[name](slug)
+            if jobs:
+                return name, jobs
+        except Exception:
+            pass
+    return None, []
+
+
+def _parse_companies_file():
+    """Read companies.txt and return list of (line_index, ats_or_None, slug, original_line)."""
+    if not os.path.exists(COMPANIES_FILE):
+        return []
+    entries = []
+    with open(COMPANIES_FILE, encoding="utf-8") as f:
+        for i, line in enumerate(f):
+            stripped = line.rstrip("\n")
+            clean = stripped.strip()
+            if not clean or clean.startswith("#"):
+                entries.append((i, None, None, stripped))
+                continue
+            if ":" in clean:
+                ats, _, slug = clean.partition(":")
+                ats = ats.strip().lower()
+                slug = slug.strip()
+                entries.append((i, ats, slug, stripped))
+            else:
+                # bare slug — auto-detect
+                entries.append((i, "auto", clean, stripped))
+    return entries
+
+
+def _rewrite_companies_file(entries):
+    """Write updated entries back to companies.txt."""
+    lines = []
+    for _, ats, slug, original in entries:
+        if ats is None:
+            lines.append(original)
+        else:
+            lines.append(original)
+    with open(COMPANIES_FILE, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
+
+
+def _fetch_one_company(entry):
+    """Fetch jobs for one entry. Returns (updated_entry, jobs, error_str_or_None)."""
+    idx, ats, slug, original = entry
+    if ats is None or slug is None:
+        return entry, [], None
+
+    if ats == "auto":
+        # auto-detect and cache result
+        try:
+            detected, jobs = _autodetect_ats(slug)
+            if detected:
+                new_line = f"detected_{detected}:{slug}"
+                new_entry = (idx, f"detected_{detected}", slug, new_line)
+                return new_entry, jobs, None
+            else:
+                return entry, [], f"auto-detect found nothing for '{slug}'"
+        except Exception as e:
+            return entry, [], f"auto-detect error for '{slug}': {e}"
+
+    # Handle "detected_ats" prefix written by previous auto-detect
+    real_ats = ats.replace("detected_", "") if ats.startswith("detected_") else ats
+    fetcher = _ATS_FETCHERS.get(real_ats)
+    if fetcher is None:
+        return entry, [], f"unknown ATS '{ats}' for slug '{slug}'"
+    try:
+        jobs = fetcher(slug)
+        return entry, jobs, None
+    except Exception as e:
+        return entry, [], f"ATS:{ats}/{slug}: {e}"
+
+
+def fetch_ats(limit=None):
+    """Fetch jobs from all companies in companies.txt using public ATS APIs."""
+    entries = _parse_companies_file()
+    company_entries = [(i, a, s, o) for i, a, s, o in entries if a is not None and s is not None]
+
+    if not company_entries:
+        print("[warn] ats: companies.txt is empty or missing")
+        return []
+
+    all_jobs = []
+    updated_entries = list(entries)  # track rewrites from auto-detect
+    errors = []
+    resolved = 0
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=ATS_WORKERS) as pool:
+        futures = {pool.submit(_fetch_one_company, e): e for e in company_entries}
+        for future in concurrent.futures.as_completed(futures):
+            try:
+                new_entry, jobs, err = future.result()
+                if err:
+                    errors.append(err)
+                else:
+                    # Filter to remote-only jobs
+                    remote_jobs = [j for j in jobs if _looks_remote(j)]
+                    # Strip internal helper keys
+                    for j in remote_jobs:
+                        j.pop("_ashby_remote", None)
+                    all_jobs.extend(remote_jobs)
+                    if jobs:
+                        resolved += 1
+                    print(f"[ok]   ats:{new_entry[1]}/{new_entry[2]}: "
+                          f"{len(jobs)} total, {len(remote_jobs)} remote")
+                    # Update entry if auto-detect rewrote it
+                    orig_idx = new_entry[0]
+                    updated_entries[orig_idx] = new_entry
+            except Exception as exc:
+                errors.append(str(exc))
+
+    for err in errors:
+        print(f"[warn] {err}")
+
+    # Persist any auto-detect rewrites
+    if any(updated_entries[i][3] != entries[i][3]
+           for i in range(len(entries)) if i < len(updated_entries)):
+        try:
+            _rewrite_companies_file(updated_entries)
+        except Exception as e:
+            print(f"[warn] could not rewrite companies.txt: {e}")
+
+    print(f"[info] ats: {resolved}/{len(company_entries)} companies resolved, "
+          f"{len(all_jobs)} remote jobs collected")
+    if limit:
+        return all_jobs[:limit]
+    return all_jobs
+
+
+SOURCES = [
+    fetch_remoteok,
+    fetch_remotive,
+    fetch_arbeitnow,
+    fetch_jobicy,
+    fetch_wwr,
+    fetch_himalayas,
+    fetch_working_nomads,
+    fetch_ats,
+]
 
 
 def gather_jobs(limit=None):
