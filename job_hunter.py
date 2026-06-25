@@ -1090,8 +1090,13 @@ def print_digest(jobs, errors):
 
 
 def send_email(html_body, job_count, to=None, subject=None):
-    user = os.environ["GMAIL_USER"]
-    pw = os.environ["GMAIL_APP_PASSWORD"]
+    user = os.environ.get("GMAIL_USER", "")
+    pw = os.environ.get("GMAIL_APP_PASSWORD", "")
+    if not user or not pw:
+        raise RuntimeError(
+            "GMAIL_USER or GMAIL_APP_PASSWORD secret is not set in GitHub Actions. "
+            "Go to Repo → Settings → Secrets and variables → Actions and add them."
+        )
     to = to or os.environ.get("MAIL_TO", user)
     subject = subject or f"[Jobs] {job_count} remote QA/SDET roles — {dt.date.today():%d %b}"
 
@@ -1102,6 +1107,7 @@ def send_email(html_body, job_count, to=None, subject=None):
     msg.attach(MIMEText("Open in an HTML-capable client.", "plain"))
     msg.attach(MIMEText(html_body, "html"))
 
+    print(f"[info] connecting to smtp.gmail.com:465 as {user} → sending to {to}")
     with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
         server.login(user, pw)
         server.sendmail(user, [a.strip() for a in to.split(",")], msg.as_string())
@@ -1135,11 +1141,14 @@ def run_python_pipeline(raw, errors, dry_run=False):
         return
 
     subject = f"[Python Jobs] {len(py_jobs)} remote roles — {dt.date.today():%d %b}"
-    send_email(html_body, len(py_jobs), to=PYTHON_MAIL_TO, subject=subject)
-    _save_seen_file(py_seen_data, PY_SEEN_FILE)
-
-    with open("digest_python.html", "w", encoding="utf-8") as f:
-        f.write(html_body)
+    try:
+        send_email(html_body, len(py_jobs), to=PYTHON_MAIL_TO, subject=subject)
+    except Exception as e:
+        print(f"[fail] Python email: {e}")
+    finally:
+        _save_seen_file(py_seen_data, PY_SEEN_FILE)
+        with open("digest_python.html", "w", encoding="utf-8") as f:
+            f.write(html_body)
 
 
 # --------------------------------------------------------------------------- #
@@ -1186,10 +1195,15 @@ def main():
             f.write(html_body)
         print("[dry-run] digest.html written. No email sent.")
     else:
-        send_email(html_body, len(jobs))
-        save_seen(seen)
-        with open("digest.html", "w", encoding="utf-8") as f:
-            f.write(html_body)
+        try:
+            send_email(html_body, len(jobs))
+        except Exception as e:
+            print(f"[fail] QA email: {e}")
+        finally:
+            # Always persist seen-state so re-runs don't resend the same jobs
+            save_seen(seen)
+            with open("digest.html", "w", encoding="utf-8") as f:
+                f.write(html_body)
 
     # ── Pipeline 2: Python Developer (India-eligible) ────────────────────────
     run_python_pipeline(raw, errors, dry_run=args.dry_run)
