@@ -93,6 +93,68 @@ NEGATIVE = [
 ]
 
 # --------------------------------------------------------------------------- #
+# PYTHON DEVELOPER PROFILE  (parallel pipeline, separate email)
+# --------------------------------------------------------------------------- #
+
+PYTHON_MAIL_TO = os.environ.get("PYTHON_MAIL_TO", "ashwarysoni17@gmail.com")
+PY_SEEN_FILE = "seen_python.json"
+PY_TOP_N = 25
+
+# Role terms that must appear somewhere in the job to be considered.
+# Secondary gate: "python" must also appear in the blob (enforced in score_python).
+PY_ROLE_CORE = [
+    "python developer", "python engineer", "python programmer",
+    "senior python", "backend developer", "backend engineer",
+    "software engineer", "software developer", "fullstack", "full stack",
+    "full-stack", "api developer", "data engineer", "platform engineer",
+]
+PY_SKILLS_HIGH = [
+    "python", "fastapi", "django", "flask", "rest api", "api development",
+    "sql", "postgresql", "mysql", "oop", "object oriented", "pytest",
+    "requests", "api integration", "json", "modular framework",
+]
+PY_SKILLS_MED = [
+    "ci/cd", "jenkins", "github actions", "docker", "kubernetes", "git",
+    "aws", "gcp", "azure", "agile", "scrum", "microservices", "celery",
+    "redis", "rabbitmq", "kafka", "linux", "bash",
+]
+PY_NICE_TO_HAVE = [
+    "genai", "generative ai", "llm", "langchain", "openai", "claude",
+    "copilot", "ml", "machine learning", "data pipeline", "ocr",
+    "computer vision", "confluence", "adb", "android",
+]
+PY_NEGATIVE = [
+    "unpaid", "internship", "intern ", "commission only", "no remote",
+    "onsite only", "entry level", "junior", "fresher",
+]
+
+# India-eligibility: always-on for the Python pipeline.
+# Exclude jobs explicitly restricted to non-India regions.
+_INDIA_HARD_EXCLUDE = [
+    "us only", "us-only", "us-based", "us citizen", "us resident",
+    "authorized to work in the us", "authorized to work in us",
+    "must be located in the us", "must reside in the us",
+    "must be based in the us", "must live in the us",
+    "eu only", "europe only", "uk only", "uk resident", "uk citizen",
+    "canada only", "australia only", "new zealand only",
+    "must be in the uk", "must be in europe",
+]
+
+
+def _india_eligible(job):
+    """Return True if Indians can plausibly apply (always-on for the Python pipeline)."""
+    blob = (job.get("location", "") + " " + job.get("description", "")).lower()
+    # Explicitly India/APAC/worldwide → always eligible
+    if any(kw in blob for kw in ("india", "apac", "asia", "worldwide",
+                                  "anywhere", "global", "all countries")):
+        return True
+    # Explicitly restricted to a non-India region → drop
+    if any(kw in blob for kw in _INDIA_HARD_EXCLUDE):
+        return False
+    # Unspecified remote (no region lock) → give benefit of the doubt
+    return True
+
+# --------------------------------------------------------------------------- #
 # SOURCES — each returns a list of normalized dicts:
 #   {title, company, url, tags(list[str]), location, posted(datetime|None),
 #    description, source}
@@ -104,7 +166,7 @@ def _parse_date(value):
         return None
     if isinstance(value, (int, float)):
         try:
-            return dt.datetime.utcfromtimestamp(int(value))
+            return dt.datetime.fromtimestamp(int(value), dt.timezone.utc).replace(tzinfo=None)
         except Exception:
             return None
     s = str(value)
@@ -749,7 +811,7 @@ def score(job):
 
     # recency bonus
     if job["posted"]:
-        age = (dt.datetime.utcnow() - job["posted"]).days
+        age = (dt.datetime.now(dt.timezone.utc).replace(tzinfo=None) - job["posted"]).days
         if age <= 1:
             s += 4
         elif age <= 3:
@@ -765,7 +827,7 @@ def score(job):
 def recent_enough(job):
     if not job["posted"]:
         return True  # keep undated jobs; many RSS items lack reliable dates
-    return (dt.datetime.utcnow() - job["posted"]).days <= RECENT_DAYS
+    return (dt.datetime.now(dt.timezone.utc).replace(tzinfo=None) - job["posted"]).days <= RECENT_DAYS
 
 
 def rank(jobs):
@@ -775,31 +837,93 @@ def rank(jobs):
     return scored
 
 
+def score_python(job):
+    """Score a job against the Python developer profile. Returns None if not a match."""
+    title = job["title"].lower()
+    tags = " ".join(job["tags"]).lower()
+    desc = job["description"].lower()
+    blob = f"{title} {tags} {desc}"
+
+    # Hard gate 1: must look like a dev role
+    if not any(t in blob for t in PY_ROLE_CORE):
+        return None
+    # Hard gate 2: must mention Python somewhere
+    if "python" not in blob:
+        return None
+    # Hard gate 3: must be India-eligible
+    if not _india_eligible(job):
+        return None
+
+    s = 0.0
+    s += 10 * _count(PY_ROLE_CORE, title)
+    s += 5 * _count(PY_ROLE_CORE, tags)
+    s += 2 * min(_count(PY_ROLE_CORE, desc), 2)
+
+    s += 3 * _count(PY_SKILLS_HIGH, blob)
+    s += 1.5 * _count(PY_SKILLS_MED, blob)
+    s += 1 * _count(PY_NICE_TO_HAVE, blob)
+    s -= 8 * _count(PY_NEGATIVE, blob)
+
+    if job["posted"]:
+        age = (dt.datetime.now(dt.timezone.utc).replace(tzinfo=None) - job["posted"]).days
+        if age <= 1:
+            s += 4
+        elif age <= 3:
+            s += 2
+
+    job = dict(job)  # don't mutate the original (shared with QA pipeline)
+    job["score"] = round(s, 1)
+    job["matched_skills"] = sorted({
+        t for t in (PY_SKILLS_HIGH + PY_SKILLS_MED + PY_NICE_TO_HAVE) if t in blob
+    })
+    return job
+
+
+def rank_python(jobs):
+    scored = [score_python(j) for j in jobs]
+    scored = [j for j in scored if j and j["score"] > 0 and recent_enough(j)]
+    scored.sort(key=lambda j: j["score"], reverse=True)
+    return scored
+
+
 # --------------------------------------------------------------------------- #
 # SEEN-STATE (avoid emailing the same job twice)
 # --------------------------------------------------------------------------- #
 
-def load_seen():
+def _load_seen_file(path):
     try:
-        with open(SEEN_FILE) as f:
+        with open(path) as f:
             return json.load(f)
     except Exception:
         return {}
 
 
-def save_seen(seen):
-    cutoff = (dt.datetime.utcnow() - dt.timedelta(days=SEEN_TTL_DAYS)).isoformat()
+def _save_seen_file(seen, path):
+    cutoff = (dt.datetime.now(dt.timezone.utc).replace(tzinfo=None) - dt.timedelta(days=SEEN_TTL_DAYS)).isoformat()
     seen = {u: ts for u, ts in seen.items() if ts >= cutoff}
-    with open(SEEN_FILE, "w") as f:
+    with open(path, "w") as f:
         json.dump(seen, f, indent=0)
 
 
-def filter_unseen(jobs, seen):
-    now = dt.datetime.utcnow().isoformat()
+def _filter_unseen_file(jobs, seen):
+    now = dt.datetime.now(dt.timezone.utc).replace(tzinfo=None).isoformat()
     fresh = [j for j in jobs if j["url"] and j["url"] not in seen]
     for j in fresh:
         seen[j["url"]] = now
     return fresh
+
+
+# Thin wrappers kept for the QA pipeline (backward-compatible names)
+def load_seen():
+    return _load_seen_file(SEEN_FILE)
+
+
+def save_seen(seen):
+    _save_seen_file(seen, SEEN_FILE)
+
+
+def filter_unseen(jobs, seen):
+    return _filter_unseen_file(jobs, seen)
 
 
 # --------------------------------------------------------------------------- #
@@ -860,11 +984,70 @@ def gemini_annotate(jobs):
     return jobs
 
 
+def gemini_annotate_python(jobs):
+    """Gemini re-rank for the Python developer pipeline (same API key, different prompt)."""
+    key = os.environ.get("GEMINI_API_KEY")
+    if not key or not jobs:
+        return jobs
+    model = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
+    url = (f"https://generativelanguage.googleapis.com/v1beta/models/"
+           f"{model}:generateContent?key={key}")
+
+    listing = "\n".join(
+        f'{i}. {j["title"]} @ {j["company"]} | skills: {", ".join(j["matched_skills"])}'
+        for i, j in enumerate(jobs)
+    )
+    prompt = (
+        "You are screening remote jobs for a Senior Python Developer with 9 years of "
+        "experience in Python, OOP, REST API development (FastAPI/Django/Flask), SQL, "
+        "CI/CD (Jenkins), modular framework design, GenAI tooling (Claude, Copilot), "
+        "and system/log data processing. Candidate is based in India.\n"
+        "For each job below, return a JSON array of objects with keys: "
+        '"i" (the index), "fit" (0-100 integer), "why" (max 12 words). '
+        "Return ONLY the JSON array, no markdown.\n\n" + listing
+    )
+    try:
+        r = _gemini_post(url, {"contents": [{"parts": [{"text": prompt}]}]})
+        text = r.json()["candidates"][0]["content"]["parts"][0]["text"]
+        text = re.sub(r"^```(?:json)?|```$", "", text.strip(), flags=re.M).strip()
+        annotations = {a["i"]: a for a in json.loads(text)}
+        for i, j in enumerate(jobs):
+            a = annotations.get(i, {})
+            j["fit"] = a.get("fit")
+            j["why"] = a.get("why", "")
+        jobs.sort(key=lambda j: (j.get("fit") is not None, j.get("fit", 0)), reverse=True)
+        print(f"[ok]   gemini-python: annotated {len(annotations)} jobs")
+    except Exception as e:
+        print(f"[warn] gemini-python skipped: {e}")
+    return jobs
+
+
+def _print_digest(jobs, errors, label="QA/SDET"):
+    """Print a plain-text digest to stdout for --dry-run mode."""
+    print(f"\n{'='*60}")
+    print(f"  Remote {label} Digest — {dt.date.today():%d %b %Y}")
+    print(f"  {len(jobs)} new roles")
+    print(f"{'='*60}\n")
+    for n, j in enumerate(jobs, 1):
+        posted = j["posted"].strftime("%d %b") if j["posted"] else "—"
+        fit = f"  Gemini fit: {j['fit']}% — {j['why']}" if j.get("fit") else ""
+        print(f"{n:2}. {j['title']} @ {j['company']}")
+        print(f"    {j['location']} · {j['source']} · {posted} · score {j['score']}")
+        if j["matched_skills"]:
+            print(f"    Skills: {', '.join(j['matched_skills'][:8])}")
+        if fit:
+            print(f"   {fit}")
+        print(f"    {j['url']}")
+        print()
+    if errors:
+        print(f"Sources that failed: {'; '.join(errors)}")
+
+
 # --------------------------------------------------------------------------- #
 # EMAIL + HTML
 # --------------------------------------------------------------------------- #
 
-def build_html(jobs, errors):
+def build_html(jobs, errors, heading="Remote QA / SDET jobs"):
     today = dt.date.today().strftime("%A, %d %b %Y")
     rows = []
     for n, j in enumerate(jobs, 1):
@@ -893,7 +1076,7 @@ def build_html(jobs, errors):
                + "; ".join(html.escape(e) for e in errors) + "</p>")
     return f"""
     <div style="font-family:-apple-system,Segoe UI,Roboto,sans-serif;max-width:640px;margin:auto">
-      <h2 style="margin-bottom:0">Remote QA / SDET jobs — {today}</h2>
+      <h2 style="margin-bottom:0">{html.escape(heading)} — {today}</h2>
       <p style="color:#666;margin-top:4px">{len(jobs)} new matches for your profile.</p>
       <table style="width:100%;border-collapse:collapse">{''.join(rows)}</table>
       {err}
@@ -903,33 +1086,17 @@ def build_html(jobs, errors):
 
 
 def print_digest(jobs, errors):
-    """Print a plain-text digest to stdout for --dry-run mode."""
-    print(f"\n{'='*60}")
-    print(f"  Remote QA/SDET Digest — {dt.date.today():%d %b %Y}")
-    print(f"  {len(jobs)} new roles")
-    print(f"{'='*60}\n")
-    for n, j in enumerate(jobs, 1):
-        posted = j["posted"].strftime("%d %b") if j["posted"] else "—"
-        fit = f"  Gemini fit: {j['fit']}% — {j['why']}" if j.get("fit") else ""
-        print(f"{n:2}. {j['title']} @ {j['company']}")
-        print(f"    {j['location']} · {j['source']} · {posted} · score {j['score']}")
-        if j["matched_skills"]:
-            print(f"    Skills: {', '.join(j['matched_skills'][:8])}")
-        if fit:
-            print(f"   {fit}")
-        print(f"    {j['url']}")
-        print()
-    if errors:
-        print(f"Sources that failed: {'; '.join(errors)}")
+    _print_digest(jobs, errors, label="QA/SDET")
 
 
-def send_email(html_body, job_count):
+def send_email(html_body, job_count, to=None, subject=None):
     user = os.environ["GMAIL_USER"]
     pw = os.environ["GMAIL_APP_PASSWORD"]
-    to = os.environ.get("MAIL_TO", user)
+    to = to or os.environ.get("MAIL_TO", user)
+    subject = subject or f"[Jobs] {job_count} remote QA/SDET roles — {dt.date.today():%d %b}"
 
     msg = MIMEMultipart("alternative")
-    msg["Subject"] = f"[Jobs] {job_count} remote QA/SDET roles — {dt.date.today():%d %b}"
+    msg["Subject"] = subject
     msg["From"] = user
     msg["To"] = to
     msg.attach(MIMEText("Open in an HTML-capable client.", "plain"))
@@ -939,6 +1106,40 @@ def send_email(html_body, job_count):
         server.login(user, pw)
         server.sendmail(user, [a.strip() for a in to.split(",")], msg.as_string())
     print(f"[ok]   emailed {job_count} jobs to {to}")
+
+
+def run_python_pipeline(raw, errors, dry_run=False):
+    """Score raw jobs against the Python developer profile and email/print results."""
+    print("\n[info] === Python Developer Pipeline ===")
+    py_jobs = rank_python(dedupe(raw))
+    print(f"[info] {len(py_jobs)} jobs passed Python developer filter (India-eligible, remote)")
+
+    py_seen_data = _load_seen_file(PY_SEEN_FILE)
+    py_jobs = _filter_unseen_file(py_jobs, py_seen_data)[:PY_TOP_N]
+    print(f"[info] {len(py_jobs)} new Python jobs after dedupe-vs-history")
+
+    py_jobs = gemini_annotate_python(py_jobs)
+
+    html_body = build_html(
+        py_jobs, errors,
+        heading="Remote Python Developer jobs (India-eligible)"
+    ) if py_jobs else (
+        "<p>No new remote Python Developer roles matched today. Pipeline ran fine.</p>"
+    )
+
+    if dry_run:
+        _print_digest(py_jobs, errors, label="Python Developer")
+        with open("digest_python.html", "w", encoding="utf-8") as f:
+            f.write(html_body)
+        print("[dry-run] digest_python.html written. No email sent.")
+        return
+
+    subject = f"[Python Jobs] {len(py_jobs)} remote roles — {dt.date.today():%d %b}"
+    send_email(html_body, len(py_jobs), to=PYTHON_MAIL_TO, subject=subject)
+    _save_seen_file(py_seen_data, PY_SEEN_FILE)
+
+    with open("digest_python.html", "w", encoding="utf-8") as f:
+        f.write(html_body)
 
 
 # --------------------------------------------------------------------------- #
@@ -957,9 +1158,12 @@ def parse_args():
 def main():
     args = parse_args()
 
+    # Fetch once — both pipelines share the same raw job pool
     raw, errors = gather_jobs(limit=args.limit)
     print(f"[info] gathered {len(raw)} raw jobs")
 
+    # ── Pipeline 1: QA / SDET ───────────────────────────────────────────────
+    print("\n[info] === QA/SDET Pipeline ===")
     jobs = rank(dedupe(raw))
     print(f"[info] {len(jobs)} jobs passed the QA/SDET filter")
 
@@ -977,17 +1181,18 @@ def main():
         if jobs:
             print_digest(jobs, errors)
         else:
-            print("[info] No new jobs matched today.")
+            print("[info] No new QA/SDET jobs matched today.")
         with open("digest.html", "w", encoding="utf-8") as f:
             f.write(html_body)
         print("[dry-run] digest.html written. No email sent.")
-        return
+    else:
+        send_email(html_body, len(jobs))
+        save_seen(seen)
+        with open("digest.html", "w", encoding="utf-8") as f:
+            f.write(html_body)
 
-    send_email(html_body, len(jobs))
-    save_seen(seen)
-
-    with open("digest.html", "w", encoding="utf-8") as f:
-        f.write(html_body)
+    # ── Pipeline 2: Python Developer (India-eligible) ────────────────────────
+    run_python_pipeline(raw, errors, dry_run=args.dry_run)
 
 
 if __name__ == "__main__":
