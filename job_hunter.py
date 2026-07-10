@@ -54,15 +54,6 @@ RECENT_DAYS = 4                  # only consider jobs posted within this window
 SEEN_FILE = "seen.json"
 SEEN_TTL_DAYS = 21               # forget jobs after this many days so the file stays small
 
-# When True, downrank/drop jobs that explicitly exclude India/APAC.
-# Flip via env var LOCATION_FILTER=1 or set to True here.
-LOCATION_FILTER = os.environ.get("LOCATION_FILTER", "0") in ("1", "true", "yes")
-
-# Terms that signal the role is restricted to a region that excludes India/APAC.
-_LOCATION_EXCLUDE = ["us only", "us-based", "us citizens", "us residents",
-                     "eu only", "europe only", "uk only", "must be based in",
-                     "authorized to work in the us", "authorized to work in us"]
-
 # ---- Your profile. Edit these lists to retune relevance. ------------------ #
 # A job must contain at least one ROLE_CORE term (in title/tags/description)
 # to even be considered. This is what keeps generic "Software Engineer" roles
@@ -128,30 +119,166 @@ PY_NEGATIVE = [
     "onsite only", "entry level", "junior", "fresher",
 ]
 
-# India-eligibility: always-on for the Python pipeline.
-# Exclude jobs explicitly restricted to non-India regions.
-_INDIA_HARD_EXCLUDE = [
-    "us only", "us-only", "us-based", "us citizen", "us resident",
-    "authorized to work in the us", "authorized to work in us",
-    "must be located in the us", "must reside in the us",
-    "must be based in the us", "must live in the us",
-    "eu only", "europe only", "uk only", "uk resident", "uk citizen",
-    "canada only", "australia only", "new zealand only",
-    "must be in the uk", "must be in europe",
-]
+# India-eligibility: always-on for BOTH pipelines and the ATS layer.
+# A job is dropped unless Indians can plausibly apply to it.
+
+# Reliable positive signal from the *structured location field itself*
+# (e.g. "Worldwide", "APAC", "India, APAC, Europe"). Trusted even if the
+# description also contains contradictory boilerplate — deliberately set
+# location fields are the least ambiguous data we get from any source.
+_LOCATION_ALLOW = re.compile(
+    r"\b(india|apac|asia|worldwide|anywhere|global|international|"
+    r"all countries)\b", re.I)
+
+# Free-text signal is far noisier — companies routinely describe themselves
+# as a "global brand" or mention "APAC/EMEA subsidiaries" as boilerplate
+# with zero bearing on where THIS role can actually be worked. Bare region
+# words are therefore never trusted here (only the structured location
+# field is reliable enough for that) — only explicit "you may work from
+# anywhere/India" phrasing about the role itself counts.
+_DESC_ALLOW = re.compile(
+    r"\b("
+    r"work(ing)? from anywhere|remote from anywhere|apply from anywhere|"
+    r"open to (candidates|applicants)[\w\s,]{0,30}"
+    r"(anywhere|worldwide|globally|any country|india)|"
+    r"hir(?:e|ing)[\w\s,]{0,20}(anywhere|worldwide|globally|in india|from india)|"
+    r"no (?:location|geographic) restrictions?|"
+    r"candidates? (?:from|in|based) any(?:where)? (?:country|location)|"
+    r"remote[- ]?(?:role|position|job)?[\s,-]*(?:worldwide|anywhere)|"
+    r"(?:this role|this position|the role) is (?:fully )?open (?:to|worldwide|globally)"
+    r")\b", re.I)
+
+# Phrases that restrict a role to a region/work-authorization that excludes India.
+# NOTE: text is run through _normalize_abbrev() before matching, so "u.s."/
+# "u.k." have already become "us"/"uk" — no need for period-literal alternatives.
+_ELIGIBLE_EXCLUDE = re.compile(
+    r"\b("
+    r"us only|us-only|us-based|us citizen|us resident|us permanent resident|"
+    r"authorized to work in (the )?us\b|authorized to work in the united states|"
+    r"must be (located|based|residing) in the (us|united states)|"
+    r"must reside in the (us|united states)|"
+    r"must live in the (us|united states)|"
+    r"work authorization required|unrestricted work authorization|"
+    r"no (visa )?sponsorship|sponsorship (is )?not (available|provided)|"
+    r"green card holders?( only)?|must have a green card|"
+    r"right to work in the (us|uk|united kingdom)|"
+    r"eu only|europe only|uk only|uk resident|uk citizen|"
+    r"canada only|australia only|new zealand only|"
+    r"must be (in|based in) (the )?(uk|europe|canada|australia)|"
+    r"(est|pst|cst|mst|cet) time ?zone required|"
+    r"must overlap with (us|est|pst|cst|mst) (business )?hours|"
+    r"us business hours overlap"
+    r")\b", re.I)
+
+# Single-country/state/city location strings that, absent any positive signal
+# above, mean the role is not actually open to India.
+_NON_INDIA_LOCATIONS = {
+    "united states", "usa", "us", "united kingdom", "uk", "canada",
+    "australia", "new zealand", "germany", "france", "ireland",
+    "netherlands", "spain", "italy", "poland", "singapore",
+    "alabama", "alaska", "arizona", "arkansas", "california", "colorado",
+    "connecticut", "delaware", "florida", "georgia", "hawaii", "idaho",
+    "illinois", "indiana", "iowa", "kansas", "kentucky", "louisiana",
+    "maine", "maryland", "massachusetts", "michigan", "minnesota",
+    "mississippi", "missouri", "montana", "nebraska", "nevada",
+    "new hampshire", "new jersey", "new mexico", "new york",
+    "north carolina", "north dakota", "ohio", "oklahoma", "oregon",
+    "pennsylvania", "rhode island", "south carolina", "south dakota",
+    "tennessee", "texas", "utah", "vermont", "virginia", "washington",
+    "west virginia", "wisconsin", "wyoming",
+    "san francisco", "new york city", "los angeles", "seattle", "boston",
+    "chicago", "austin", "denver", "atlanta", "dallas", "houston", "miami",
+    "washington dc", "philadelphia", "san diego", "portland", "phoenix",
+    "london", "toronto", "vancouver", "berlin", "dublin", "amsterdam",
+    "paris", "madrid", "warsaw", "sydney", "melbourne",
+}
+
+_LOCATION_FILLER_WORDS = {
+    "remote", "fully", "100", "distributed", "anywhere", "home", "work",
+    "from", "wfh", "based", "only", "office", "hybrid", "flexible",
+    "location", "in", "the", "or", "and", "region",
+}
+# Unambiguous US state postal codes (excludes ones that collide with common
+# English words, e.g. "or", "in", "me", "hi", "ok", "la").
+_SAFE_US_STATE_ABBR = {
+    "ca", "ny", "tx", "wa", "ma", "co", "ga", "fl", "pa", "oh", "mi",
+    "nc", "va", "nj", "az", "mn", "wi", "md", "ct", "nv", "tn", "il",
+}
 
 
-def _india_eligible(job):
-    """Return True if Indians can plausibly apply (always-on for the Python pipeline)."""
-    blob = (job.get("location", "") + " " + job.get("description", "")).lower()
-    # Explicitly India/APAC/worldwide → always eligible
-    if any(kw in blob for kw in ("india", "apac", "asia", "worldwide",
-                                  "anywhere", "global", "all countries")):
+def _normalize_abbrev(text):
+    """Collapse dotted abbreviations ("U.S.", "U.S.A.", "U.K.") to plain
+    letters so downstream regexes don't need period-literal alternatives —
+    a trailing \\b right after a "." never matches (both are non-word chars),
+    which silently broke matching on strings like "Remote in U.S." otherwise."""
+    return (text.replace("u.s.a.", "usa")
+                .replace("u.s.", "us")
+                .replace("u.k.", "uk"))
+
+
+def _clean_location_segment(segment):
+    tokens = [t for t in re.sub(r"[^a-z ]", " ", segment).split() if t]
+    return tokens
+
+
+def _location_is_locked_out(location):
+    """True if the structured location field names one or more non-India
+    places (country/state/major city) — e.g. "Ohio, United States" or
+    "San Francisco, CA" — with no sign of remote flexibility. A location
+    with any unrecognized segment is left ambiguous (not locked out)."""
+    segments = re.split(r"[,/]| - | or ", location)
+    matched_any = False
+    for seg in segments:
+        tokens = _clean_location_segment(seg)
+        if not tokens:
+            continue
+        if any(t in _SAFE_US_STATE_ABBR for t in tokens):
+            matched_any = True
+            continue
+        tokens = [t for t in tokens if t not in _LOCATION_FILLER_WORDS]
+        if not tokens:
+            continue
+        if " ".join(tokens) in _NON_INDIA_LOCATIONS:
+            matched_any = True
+        else:
+            return False
+    return matched_any
+
+
+# Catches restrictions that only show up in the job title, e.g. a Greenhouse
+# posting whose structured location is a broad region code ("Remote in AMER")
+# but whose title says "(Remote in Louisiana)" / "(Remote in United States)".
+_NON_INDIA_PLACE_ALT = "|".join(
+    re.escape(p) for p in sorted(_NON_INDIA_LOCATIONS, key=len, reverse=True))
+_REMOTE_IN_PLACE = re.compile(
+    rf"\bremote (?:in|from|for) (?:the )?({_NON_INDIA_PLACE_ALT})\b", re.I)
+
+
+def is_eligible_for_india(job):
+    """Return True if the job can plausibly be worked from India.
+    Always-on for the QA/SDET pipeline, the Python pipeline, and ATS fetches."""
+    location = _normalize_abbrev((job.get("location", "") or "").lower())
+    title = _normalize_abbrev((job.get("title", "") or "").lower())
+    description = _normalize_abbrev((job.get("description", "") or "").lower())
+    # Title carries real location info for some ATS boards (e.g. Greenhouse
+    # postings whose structured location is just a broad region code).
+    description = f"{title} {description}"
+
+    # Structured location field says India/APAC/worldwide/etc. — trust it.
+    if _LOCATION_ALLOW.search(location):
         return True
-    # Explicitly restricted to a non-India region → drop
-    if any(kw in blob for kw in _INDIA_HARD_EXCLUDE):
+
+    blob = f"{location} {description}"
+    if _ELIGIBLE_EXCLUDE.search(blob) or _REMOTE_IN_PLACE.search(blob):
         return False
-    # Unspecified remote (no region lock) → give benefit of the doubt
+
+    # Explicit "open to anyone/India" phrasing in the free text — but not
+    # bare marketing words like "global company" or "worldwide brand".
+    if _DESC_ALLOW.search(description):
+        return True
+
+    if _location_is_locked_out(location):
+        return False
     return True
 
 # --------------------------------------------------------------------------- #
@@ -389,6 +516,50 @@ def fetch_working_nomads(limit=None):
             except Exception as e2:
                 print(f"[warn] working_nomads RSS also failed: {e2}")
     return out
+
+
+def _fetch_simple_rss(url, source_name, limit=None):
+    """Generic RSS-feed fetcher for boards whose feed items are already
+    plain "Title @ Company"-style postings (NoDesk, Jobspresso, Pangian,
+    Virtual Vocations, ...). Returns [] quietly if feedparser is missing
+    or the feed can't be reached, so a dead/renamed feed never kills the run."""
+    if feedparser is None:
+        return []
+    out = []
+    try:
+        feed = feedparser.parse(url)
+        for e in feed.entries:
+            out.append({
+                "title": e.get("title", ""),
+                "company": e.get("author", "") or "",
+                "url": e.get("link", ""),
+                "tags": [t.get("term", "").lower() for t in e.get("tags", [])] if e.get("tags") else [],
+                "location": "Remote",
+                "posted": _parse_date(e.get("published")),
+                "description": re.sub("<[^>]+>", " ", e.get("summary", "")),
+                "source": source_name,
+            })
+            if limit and len(out) >= limit:
+                break
+    except Exception as e:
+        print(f"[warn] {source_name} RSS failed: {e}")
+    return out
+
+
+def fetch_nodesk(limit=None):
+    return _fetch_simple_rss("https://nodesk.co/remote-jobs/index.xml", "NoDesk", limit)
+
+
+def fetch_jobspresso(limit=None):
+    return _fetch_simple_rss("https://jobspresso.co/feed/?post_type=job_listing", "Jobspresso", limit)
+
+
+def fetch_pangian(limit=None):
+    return _fetch_simple_rss("https://pangian.com/feed/?post_type=job_listing", "Pangian", limit)
+
+
+def fetch_virtual_vocations(limit=None):
+    return _fetch_simple_rss("https://www.virtualvocations.com/jobs/rss", "VirtualVocations", limit)
 
 
 # --------------------------------------------------------------------------- #
@@ -688,8 +859,9 @@ def fetch_ats(limit=None):
                 if err:
                     errors.append(err)
                 else:
-                    # Filter to remote-only jobs
-                    remote_jobs = [j for j in jobs if _looks_remote(j)]
+                    # Filter to remote-only, India-eligible jobs
+                    remote_jobs = [j for j in jobs
+                                   if _looks_remote(j) and is_eligible_for_india(j)]
                     # Strip internal helper keys
                     for j in remote_jobs:
                         j.pop("_ashby_remote", None)
@@ -697,7 +869,7 @@ def fetch_ats(limit=None):
                     if jobs:
                         resolved += 1
                     print(f"[ok]   ats:{new_entry[1]}/{new_entry[2]}: "
-                          f"{len(jobs)} total, {len(remote_jobs)} remote")
+                          f"{len(jobs)} total, {len(remote_jobs)} remote+eligible")
                     # Update entry if auto-detect rewrote it
                     orig_idx = new_entry[0]
                     updated_entries[orig_idx] = new_entry
@@ -730,6 +902,10 @@ SOURCES = [
     fetch_wwr,
     fetch_himalayas,
     fetch_working_nomads,
+    fetch_nodesk,
+    fetch_jobspresso,
+    fetch_pangian,
+    fetch_virtual_vocations,
     fetch_ats,
 ]
 
@@ -772,19 +948,6 @@ def _count(terms, text):
     return sum(1 for t in terms if t in text)
 
 
-def _location_excluded(job):
-    """Return True if the job explicitly restricts to a region excluding India/APAC."""
-    if not LOCATION_FILTER:
-        return False
-    loc = (job.get("location", "") + " " + job.get("description", "")).lower()
-    if any(term in loc for term in _LOCATION_EXCLUDE):
-        # Pass-through if job also mentions worldwide/anywhere (contradictory listings)
-        if any(ok in loc for ok in ("worldwide", "anywhere", "global", "all countries")):
-            return False
-        return True
-    return False
-
-
 def score(job):
     title = job["title"].lower()
     tags = " ".join(job["tags"]).lower()
@@ -795,8 +958,8 @@ def score(job):
     if not any(t in blob for t in ROLE_CORE):
         return None
 
-    # Location filter: drop or heavily penalise if restricted region detected.
-    if _location_excluded(job):
+    # Hard gate: must be India-eligible.
+    if not is_eligible_for_india(job):
         return None
 
     s = 0.0
@@ -851,7 +1014,7 @@ def score_python(job):
     if "python" not in blob:
         return None
     # Hard gate 3: must be India-eligible
-    if not _india_eligible(job):
+    if not is_eligible_for_india(job):
         return None
 
     s = 0.0
